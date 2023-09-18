@@ -1,4 +1,3 @@
-
 import copy
 from pprint import pprint
 from typing import Any, Dict, List, Optional, Tuple
@@ -7,99 +6,133 @@ import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 from deeprvat.utils import pad_variants
-
-NORMALIZATION = {"spectral_norm":  nn.utils.parametrizations.spectral_norm,
-                 "LayerNorm":  nn.LayerNorm}
-
-class ModelAverage(nn.Module):
-    def __init__(self, model):
-        super(ModelAverage, self).__init__()
-        self.model = model
-        self.beta = model.hparams.moving_avg['beta']
-        self.start_iteration = model.hparams.moving_avg['start_iteration']
-        
-        self.averaged_model = copy.deepcopy(self.model)
-        # needs to be set because the averaged model does not have an averaged model
-        # so in stage=val its forward operation would raise an NotImplementedEerror
-        self.averaged_model.model_avg = False
-        if next(self.model.parameters()).is_cuda: self.averaged_model.cuda()
-        self.averaged_model.eval()
-        for p in self.averaged_model.parameters(): 
-            p.requires_grad = False
-        
-        self.num_updates = 0
-
-    # dont change averaged model to training
-    def train(self,mode: bool = True):
-        self.training = mode
-        for module in self.model.children():
-            module.train(mode)
-        return self
-    
-    def forward(self, *inputs, **kwargs):
-        if self.training: return self.model(*inputs, **kwargs)
-        else: return self.averaged_model(*inputs, **kwargs)
-    
-    @torch.no_grad()
-    def update_average(self):
-        self.num_updates += 1
-        if self.num_updates <= self.start_iteration:
-            beta = 0.
-        else:
-            beta = self.beta
-        source_dict = self.model.state_dict()
-        target_dict = self.averaged_model.state_dict()
-        for key in target_dict:
-            target_dict[key].data.mul_(beta).add_(source_dict[key].data, alpha=1 - beta)
-
+     
+            
 class Layer_worker(nn.Module):
-    def __init__(self, normalization, in_dim, out_dim, bias=True):
+    def __init__(self, activation, normalization, in_dim, out_dim, bias=True, solo=False):
         super().__init__()
         self.layer = nn.Linear(in_dim, out_dim, bias)
         self.normalization = normalization
-        if self.normalization: 
+        self.solo = solo
+
+        if not self.solo: 
             if self.normalization == "spectral_norm":  
                 self.layer = nn.utils.parametrizations.spectral_norm(self.layer)
-                self.normalization = False
-            elif self.normalization == "LayerNorm":
-                 self.normalization = nn.LayerNorm(out_dim)
-            elif self.normalization == "none":
-                self.normalization = False
-            else:
-                pprint(NotImplemented)
-                self.normalization = False
-        else:
-            self.normalization = False
-        
+            self.regularization = Regularization(activation, normalization)
+
     def forward(self, x):
         x = self.layer(x)
-        if self.normalization: x = self.normalization(x)
+        if not self.solo: x = self.regularization(x)
         return x
+            
 
 class Layer(nn.Module):
-    def __init__(self, normalization):
-        super().__init__()    
+    def __init__(self, activation, normalization):
+        super().__init__()   
+        self.activation = activation
         self.normalization = normalization
     
-    def __getitem__(self, *args):
-        return Layer_worker(self.normalization, *args)
-
-class ResLayer(nn.Module):
-    def __init__(self, input_dim, output_dim, layer, activation):
+    def __getitem__(self, in_dim, out_dim, bias=True, solo=False):
+        return Layer_worker(self.activation, self.normalization, in_dim, out_dim, bias, solo)
+    
+    
+class Regularization(nn.Module):
+    def __init__(self, activation, normalization):
         super().__init__()
-        self.layer_1 = layer.__getitem__(input_dim, input_dim)
         self.activation = activation
-        self.layer_2 = layer.__getitem__(input_dim, output_dim)
+        self.normalization = normalization
+        self.do_activation = True if self.activation else False
+        self.do_normalization = True if self.normalization else False
+        
+        if self.normalization == "AnnotationNorm":
+            self.normalization = Annotation_Normalization()
+        else: self.do_normalization = False
+    
+    def switch(self):
+        self.do_activation = not self.do_activation
+        self.do_normalization = not self.do_normalization
     
     def forward(self, x):
-        return x + self.layer_2(self.activation(self.layer_1(x))) 
+        if self.do_activation: x = self.activation(x)
+        if self.do_normalization: x = self.normalization(x)
+        return x
+
+class ResLayer(nn.Module):
+    def __init__(self, input_dim, output_dim, layer, solo=False):
+        super().__init__()
+        self.layer_1 = layer.__getitem__(input_dim, input_dim)
+        self.layer_2 = layer.__getitem__(input_dim, output_dim, solo=solo)
+    
+    def switch(self):
+        self.layer_2.switch()
+    
+    def forward(self, x):
+        out = self.layer_1(x) 
+        out = self.layer_2(out) + x
+        return  out
+
+# https://github.com/pytorch/vision/blob/main/torchvision/models/resnet.py
+class Bottleneck_ResLayer(nn.Module):
+    def __init__(self, input_dim, output_dim, layer, solo=False):
+        super().__init__()
+        downsample_factor = 4
+        sub_dim = input_dim // downsample_factor
+        self.layer_1 = layer.__getitem__(input_dim, sub_dim)
+        self.layer_2 = layer.__getitem__(sub_dim, sub_dim)
+        self.layer_3 = layer.__getitem__(sub_dim, output_dim, solo=solo)
+    
+    def switch(self):
+        self.layer_3.switch()
+    
+    def forward(self, x):
+        out = self.layer_1(x)    
+        out = self.layer_2(out)
+        out = self.layer_3(out) + x
+        return  out
+
+class Annotation_Normalization(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.eps = torch.tensor(1e-100, requires_grad=False)
+        # self.momentum = torch.tensor(0.99, requires_grad=False)
+        self.momentum = torch.tensor(0., requires_grad=False)
+        self.init = True
+        
+    def forward(self, x):
+        if x.ndim  == 4:
+            # exclude padded variants from mean, std computation and standardization 
+            # application to tensor
+            mask = torch.where(x.sum(dim=3) == 0, False, True)
+        else: mask = torch.ones(x.shape[:-1]).to(bool)
+        if x.ndim == 2: dims = 0
+        else: dims = list(range(0, x.ndim - 1))
+        
+        mean = torch.mean(x[mask], dim=0).detach()
+        std = torch.std(x[mask], dim=0).detach()
+
+        if self.init: 
+            if x.is_cuda: self.momentum = self.momentum.cuda()
+            self.mean = mean
+            self.std = std
+            self.init = False
+        else:
+            if self.momentum > 0:
+                self.mean = self.mean * self.momentum + mean * (1 - self.momentum)
+                self.std = self.std * self.momentum + std * (1 - self.momentum)
+            else: 
+                self.mean = mean
+                self.std = std
+        
+            x[mask] = x[mask].sub(self.mean).div(self.std.add(self.eps)) 
+        return x
 
 class Layers(nn.Module):
-    def __init__(self, n_layers, res_layers, input_dim, output_dim, activation, normalization, init_power_two, steady_dim):
+    def __init__(self, n_layers, bottleneck_layers, res_layers, input_dim, output_dim, activation, normalization, init_power_two, steady_dim):
         super().__init__()
         self.n_layers = n_layers
+        self.bottleneck_layers = bottleneck_layers
         self.res_layers = res_layers
-        self.layer = Layer(normalization)
+        self.layer = Layer(activation, normalization)
         
         self.input_dim = input_dim
         self.output_dim = output_dim
@@ -109,8 +142,8 @@ class Layers(nn.Module):
         
         self.layers, self.dims = self.get_architecture() 
         self.layer_dict = {0: {"layer": self.layer.__getitem__, "args": {}},
-                           1: {"layer": ResLayer, "args": {"layer": self.layer, 
-                                                           "activation": self.activation}}}
+                           1: {"layer": ResLayer, "args": {"layer": self.layer}},
+                           2: {"layer": Bottleneck_ResLayer, "args": {"layer": self.layer}}}
 
     def get_next_power_of_two(self, dim, factor):
         if factor == 2:
@@ -139,7 +172,7 @@ class Layers(nn.Module):
                 if i == 0 and self.init_power_two:
                     step_dim = operation(self.output_dim, self.get_next_power_of_two(input_dim, factor))
                 else:
-                    if self.res_layers <= i:
+                    if self.res_layers + self.bottleneck_layers <= i:
                         if i == self.n_layers - 1: 
                             step_dim = self.output_dim 
                         else:
@@ -157,6 +190,8 @@ class Layers(nn.Module):
             if i == 0 and self.init_power_two:
                 layers.append(0)
                 self.res_layers += 1
+            elif self.bottleneck_layers > i:
+                layers.append(2)
             elif self.res_layers > i:
                 layers.append(1)
             else:
@@ -165,21 +200,26 @@ class Layers(nn.Module):
     
     def get_architecture(self):
         assert not self.init_power_two or not self.steady_dim
-        assert self.n_layers > self.res_layers
+        # assert self.n_layers > self.res_layers + self.bottleneck_layers
         layers = self.get_layers()
         dims = self.get_dims()
         return layers, dims
 
-    def get_layer(self, i):
+    def get_layer(self, i, solo=False):
         layer = self.layer_dict[self.layers[i]]
-        layer = layer["layer"](*self.dims[i], **layer["args"])
+        layer = layer["layer"](*self.dims[i], **layer["args"], solo=solo)
+        return layer
+    
+    def get_layer_set_dim(self, i, in_dim, out_dim, bias=True, solo=False):
+        layer = self.layer_dict[self.layers[i]]
+        layer = layer["layer"](in_dim, out_dim, bias, **layer["args"], solo=solo)
         return layer
 
 class Pooling(pl.LightningModule):
-    def __init__(self, normalization, pool, dim, n_variants):
+    def __init__(self, activation, normalization, pool, dim, n_variants):
         super().__init__()
         if pool not in ('sum', 'max','softmax'):  raise ValueError(f'Unknown pooling operation {pool}')
-        self.layer = Layer(normalization)
+        self.layer = Layer(activation, normalization)
         self.pool = pool
         self.dim = dim
         self.n_variants = n_variants
@@ -208,9 +248,14 @@ class Pooling(pl.LightningModule):
             if x.shape[-1] < self.n_variants: x = pad_variants(x,self.n_variants)  
             x = x.unsqueeze(3)  #Rearrange('b g (v p) l -> b g l v p', p = self.pool_size)
             x = x * self.to_attn_logits(x).softmax(dim=-1)
-            
+
         x = self.f(x, **self.f_args)
 
         if self.pool == "softmax": x = x.squeeze(-1)
         if self.pool == "max": x = x.values
         return x
+
+NORMALIZATION = {"SpectralNorm":  nn.utils.parametrizations.spectral_norm,
+                 "LayerNorm":  nn.LayerNorm,
+                 "BatchNorm": nn.BatchNorm1d,
+                 "AnnotationNorm": Annotation_Normalization}

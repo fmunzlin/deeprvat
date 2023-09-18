@@ -217,8 +217,104 @@ def make_dataset(
         zarr.save_array(y_out_file, y.numpy())
         zarr.save_array(meta_data_out_file, meta_data)
 
-
 class MultiphenoDataset(Dataset):
+    def __init__(
+        self,
+        data: Dict[str, Dict],
+        min_variant_count: int,
+        batch_size: int,
+        split: str = "train",
+        cache_tensors: bool = False):
+        # balancing_factor: bool = False):
+        super().__init__()
+        
+        self.data = data
+        self.split = split
+        self.cache_tensors = cache_tensors
+        self.balancing_factor = False
+        self.batch_size = batch_size
+        self.active_annotations = np.arange(33)  
+        self.min_variant_count = min_variant_count
+        self.phenotypes = self.data.keys()
+        self.gene_count = int(max([max(data[pheno]["gene_id"]) for pheno, _ in self.data.items()]) + 1)
+        
+        for pheno_data in self.data.values():
+            if pheno_data["y"].shape == (pheno_data["input_tensor_zarr"].shape[0], 1):
+                pheno_data["y"] = pheno_data["y"].squeeze()
+            elif pheno_data["y"].shape != (pheno_data["input_tensor_zarr"].shape[0], ):
+                raise NotImplementedError(
+                    'Multi-phenotype training is only implemented via multiple y files'
+                )
+
+            if self.cache_tensors:
+                pheno_data["input_tensor"] = pheno_data["input_tensor_zarr"][:]
+                
+                
+        self.samples = {pheno: pheno_data["samples"][split]
+                        for pheno, pheno_data in self.data.items()}
+        self.subset_samples()
+        self.index_dict = dict(zip(list(self.phenotypes), 
+                                   np.zeros(len(list(self.phenotypes)))))
+        self.sample_idx = {pheno: np.arange(len(pheno_data)) 
+                           for pheno, pheno_data in self.samples.items()}
+
+        self.running_phenotypes = False
+        if self.balancing_factor: 
+            min_factor = min([len(self.samples[pheno]) for pheno in self.phenotypes])
+            self.balancing_factor = {pheno: min_factor / len(self.samples[pheno]) 
+                                    for pheno in self.phenotypes}
+            logger.info(f"Balancing loss by min_samples / samples[phenotype]")
+        else: 
+            self.balancing_factor = dict(zip(self.phenotypes, np.ones(len(self.phenotypes))))
+        
+    def subset_samples(self):
+        for pheno, pheno_data in self.data.items():
+            input_tensor = pheno_data["input_tensor_zarr"].oindex[self.samples[pheno]]
+            n_variants_per_sample = np.sum(
+                np.sum(input_tensor, axis=2) != 0, axis=(1, 2)
+            )
+            n_variant_mask = n_variants_per_sample >= self.min_variant_count
+            # print(self.samples[pheno].shape)
+            nan_mask = ~pheno_data["y"][self.samples[pheno]].isnan()
+            mask = n_variant_mask & nan_mask.numpy()
+            # input(nan_mask.shape)
+            n_samples_orig = self.samples[pheno].shape[0]
+            self.samples[pheno] = self.samples[pheno][mask]
+            logger.info(f"{pheno}: {self.samples[pheno].shape[0]} / "
+                        f"{n_samples_orig} samples kept")
+
+    def __len__(self):   
+        return np.sum([math.ceil((len(self.samples[pheno])) / self.batch_size) 
+                        for pheno in self.phenotypes])
+
+    def __getitem__(self, index):
+        if not self.running_phenotypes: 
+            self.running_phenotypes = list(self.phenotypes)
+            
+        pheno = random.choice(self.running_phenotypes)
+        n_samples = len(self.sample_idx[pheno])
+        start_idx = int(self.index_dict[pheno])
+        end_idx = int(min(n_samples, start_idx + self.batch_size))
+        indices = self.sample_idx[pheno][start_idx:end_idx]
+        if end_idx == n_samples: 
+            self.index_dict[pheno] = 0
+            self.running_phenotypes.remove(pheno)
+            np.random.shuffle(self.sample_idx[pheno])
+        else: self.index_dict[pheno] += self.batch_size
+        
+        annotations = (self.data[pheno]["input_tensor"][indices]
+                       if self.cache_tensors else
+                       self.data[pheno]["input_tensor_zarr"].oindex[indices, :, :, :])
+        annotations = annotations[:, :, self.active_annotations, :]
+        return {pheno: {"indices": self.samples[pheno][indices],
+                         "covariates": self.data[pheno]["covariates"][indices],
+                         "rare_variant_annotations": annotations,
+                         "y": self.data[pheno]["y"][indices],
+                         "gene_id": self.data[pheno]["gene_id"],
+                         "balancing_factor": self.balancing_factor[pheno]}}
+
+
+class MultiphenoDataset2(Dataset):
     def __init__(
         self,
         data: Dict[str, Dict],
@@ -318,6 +414,7 @@ class MultiphenoDataset(Dataset):
             n_variant_mask = n_variants_per_sample >= self.min_variant_count
 
             nan_mask = ~pheno_data["y"][self.samples[pheno]].isnan()
+
             mask = n_variant_mask & nan_mask.numpy()
             self.samples[pheno] = self.samples[pheno][mask]
 
@@ -337,7 +434,8 @@ class MultiphenoBaggingData(pl.LightningDataModule):
             upsampling_factor: int = 1,
             batch_size: Optional[int] = None,
             num_workers: Optional[int] = 0,
-            cache_tensors: bool = False):
+            cache_tensors: bool = False,
+            balancing_factor: bool = False):
         
         logger.info("Intializing datamodule")
         super().__init__()
@@ -349,6 +447,7 @@ class MultiphenoBaggingData(pl.LightningDataModule):
         self.n_genes = {
             pheno: self.data[pheno]["genes"].shape[0] for pheno in self.data.keys()
         }
+        self.balancing_factor = balancing_factor
 
         # Get the number of annotations and covariates
         # This is the same for all phenotypes, so we can look at the tensors for any one of them
@@ -437,7 +536,7 @@ class MultiphenoBaggingData(pl.LightningDataModule):
             self.hparams.batch_size,
             split="train",
             cache_tensors=self.hparams.cache_tensors,
-        )
+            balancing_factor=self.balancing_factor)
         return DataLoader(dataset, 
                           shuffle=True,
                           batch_size=None, 
@@ -451,7 +550,8 @@ class MultiphenoBaggingData(pl.LightningDataModule):
             self.hparams.min_variant_count,
             self.hparams.batch_size,
             split="val",
-            cache_tensors=self.hparams.cache_tensors)
+            cache_tensors=self.hparams.cache_tensors,
+            balancing_factor=self.balancing_factor)
         return DataLoader(
             dataset,
             batch_size=None, 
