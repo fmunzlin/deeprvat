@@ -13,49 +13,21 @@ class Layer_worker(nn.Module):
         super().__init__()
         self.layer = nn.Linear(in_dim, out_dim, bias)
         self.normalization = normalization
-        self.solo = solo
-
-        if not self.solo: 
+        self.regularization = Regularization(activation, normalization)
+        
+        if solo: self.switch()
+        else: 
             if self.normalization == "spectral_norm":  
                 self.layer = nn.utils.parametrizations.spectral_norm(self.layer)
-            self.regularization = Regularization(activation, normalization)
 
+    def switch(self):
+        self.regularization.switch() 
+    
     def forward(self, x):
         x = self.layer(x)
-        if not self.solo: x = self.regularization(x)
+        x = self.regularization(x)
         return x
-            
 
-class Layer(nn.Module):
-    def __init__(self, activation, normalization):
-        super().__init__()   
-        self.activation = activation
-        self.normalization = normalization
-    
-    def __getitem__(self, in_dim, out_dim, bias=True, solo=False):
-        return Layer_worker(self.activation, self.normalization, in_dim, out_dim, bias, solo)
-    
-    
-class Regularization(nn.Module):
-    def __init__(self, activation, normalization):
-        super().__init__()
-        self.activation = activation
-        self.normalization = normalization
-        self.do_activation = True if self.activation else False
-        self.do_normalization = True if self.normalization else False
-        
-        if self.normalization == "AnnotationNorm":
-            self.normalization = Annotation_Normalization()
-        else: self.do_normalization = False
-    
-    def switch(self):
-        self.do_activation = not self.do_activation
-        self.do_normalization = not self.do_normalization
-    
-    def forward(self, x):
-        if self.do_activation: x = self.activation(x)
-        if self.do_normalization: x = self.normalization(x)
-        return x
 
 class ResLayer(nn.Module):
     def __init__(self, input_dim, output_dim, layer, solo=False):
@@ -70,6 +42,7 @@ class ResLayer(nn.Module):
         out = self.layer_1(x) 
         out = self.layer_2(out) + x
         return  out
+
 
 # https://github.com/pytorch/vision/blob/main/torchvision/models/resnet.py
 class Bottleneck_ResLayer(nn.Module):
@@ -90,18 +63,52 @@ class Bottleneck_ResLayer(nn.Module):
         out = self.layer_3(out) + x
         return  out
 
-class Annotation_Normalization(nn.Module):
-    def __init__(self):
+
+class Layer(nn.Module):
+    def __init__(self, activation, normalization):
+        super().__init__()   
+        self.activation = activation
+        self.normalization = normalization
+    
+    def __getitem__(self, in_dim, out_dim, bias=True, solo=False):
+        return Layer_worker(self.activation, self.normalization, in_dim, out_dim, bias, solo)
+
+
+class Regularization(nn.Module):
+    def __init__(self, activation, normalization):
         super().__init__()
-        self.eps = torch.tensor(1e-100, requires_grad=False)
-        # self.momentum = torch.tensor(0.99, requires_grad=False)
-        self.momentum = torch.tensor(0., requires_grad=False)
+        self.activation = activation
+        self.normalization = normalization
+        self.do_activation = True if self.activation else False
+        self.do_normalization = True if self.normalization else False
+        
+        if self.normalization == "AnnotationNorm":
+            self.normalization = Annotation_normalization()
+        else: self.do_normalization = False
+    
+    def switch(self):
+        self.do_activation = not self.do_activation
+        self.do_normalization = not self.do_normalization
+    
+    def forward(self, x):
+        if self.do_activation: x = self.activation(x)
+        if self.do_normalization: x = self.normalization(x)
+        return x
+        
+
+class Annotation_normalization(nn.Module):
+    def __init__(self, eps=1e-100, momentum=0.99):
+        super().__init__()
+        self.eps = torch.tensor(eps, requires_grad=False)
+        self.momentum = torch.tensor(momentum, requires_grad=False)
         self.init = True
         
     def forward(self, x):
         if x.ndim  == 4:
             # exclude padded variants from mean, std computation and standardization 
             # application to tensor
+            # only applies to inital layer, since all subsequent will do (x * weight) + bias
+            # and since they wont sum to 0, only the inital layer will be considered
             mask = torch.where(x.sum(dim=3) == 0, False, True)
         else: mask = torch.ones(x.shape[:-1]).to(bool)
         if x.ndim == 2: dims = 0
@@ -125,6 +132,7 @@ class Annotation_Normalization(nn.Module):
         
             x[mask] = x[mask].sub(self.mean).div(self.std.add(self.eps)) 
         return x
+
 
 class Layers(nn.Module):
     def __init__(self, n_layers, bottleneck_layers, res_layers, input_dim, output_dim, activation, normalization, init_power_two, steady_dim):
@@ -215,6 +223,7 @@ class Layers(nn.Module):
         layer = layer["layer"](in_dim, out_dim, bias, **layer["args"], solo=solo)
         return layer
 
+
 class Pooling(pl.LightningModule):
     def __init__(self, activation, normalization, pool, dim, n_variants):
         super().__init__()
@@ -258,4 +267,4 @@ class Pooling(pl.LightningModule):
 NORMALIZATION = {"SpectralNorm":  nn.utils.parametrizations.spectral_norm,
                  "LayerNorm":  nn.LayerNorm,
                  "BatchNorm": nn.BatchNorm1d,
-                 "AnnotationNorm": Annotation_Normalization}
+                 "AnnotationNorm": Annotation_normalization}
