@@ -259,6 +259,8 @@ class DeepSetAgg(pl.LightningModule):
         # burden_score
         return x
 
+
+
 class DeepSet(BaseModel):
     def __init__(
             self,
@@ -285,7 +287,9 @@ class DeepSet(BaseModel):
         pprint(self.hparams)
 
         self.normalization = getattr(self.hparams, "normalization", False)
-        self.activation = getattr(nn, getattr(self.hparams, "activation", "LeakyReLU"))()
+        self.activation = getattr(nn, getattr(self.hparams, "activation", "LeakyReLU"))(inplace=False)
+        # self.activation = GELU()
+        # SiLU
         self.use_sigmoid = getattr(self.hparams, "use_sigmoid", False)
         self.use_tanh = getattr(self.hparams, "use_tanh", False)
         self.reverse = getattr(self.hparams, "reverse", False)
@@ -322,7 +326,6 @@ class DeepSet(BaseModel):
                 reverse=self.reverse
             )
         self.agg_model.train(False if self.hparams.stage == "val" else True)
-
         self.train(False if self.hparams.stage == "val" else True)
     
     def get_model(self, prefix, input_dim, output_dim, n_layers, bottleneck_layers, res_layers):
@@ -350,3 +353,7 @@ class DeepSet(BaseModel):
                                                     pheno, 
                                                     this_batch["gene_id"])
         return result
+
+class GELU(nn.Module):
+    def forward(self, x):
+        return torch.sigmoid(1.702 * x) * x
