@@ -1,6 +1,7 @@
 import copy
 from pprint import pprint
 from typing import Any, Dict, List, Optional, Tuple
+import math
 
 import torch
 import torch.nn as nn
@@ -8,14 +9,14 @@ import pytorch_lightning as pl
 from deeprvat.utils import pad_variants
      
             
-class Layer_worker(nn.Module):
+class Layer_worker(pl.LightningModule):
     def __init__(self, activation, normalization, in_dim, out_dim, bias=True, solo=False):
         super().__init__()
         self.layer = nn.Linear(in_dim, out_dim, bias)
         self.solo = solo
         
         if not self.solo: 
-            self.regularization = Regularization(activation, normalization)
+            self.regularization = Regularization(out_dim, activation, normalization)
             if normalization == "spectral_norm":  
                 self.layer = nn.utils.parametrizations.spectral_norm(self.layer)
     
@@ -25,7 +26,7 @@ class Layer_worker(nn.Module):
         return x
 
 
-class ResLayer(nn.Module):
+class ResLayer(pl.LightningModule):
     def __init__(self, input_dim, output_dim, layer, solo=False):
         super().__init__()
         self.layer_1 = layer.__getitem__(input_dim, input_dim)
@@ -38,7 +39,7 @@ class ResLayer(nn.Module):
 
 
 # https://github.com/pytorch/vision/blob/main/torchvision/models/resnet.py
-class Bottleneck_ResLayer(nn.Module):
+class Bottleneck_ResLayer(pl.LightningModule):
     def __init__(self, input_dim, output_dim, layer, solo=False):
         super().__init__()
         downsample_factor = 4
@@ -54,7 +55,7 @@ class Bottleneck_ResLayer(nn.Module):
         return  out
 
 
-class Layer(nn.Module):
+class Layer(pl.LightningModule):
     def __init__(self, activation, normalization):
         super().__init__()   
         self.activation = activation
@@ -64,14 +65,14 @@ class Layer(nn.Module):
         return Layer_worker(self.activation, self.normalization, in_dim, out_dim, bias, solo)
 
 
-class Regularization(nn.Module):
-    def __init__(self, activation, normalization):
+class Regularization(pl.LightningModule):
+    def __init__(self, in_dim, activation, normalization):
         super().__init__()
         self.activation = activation
         self.normalization = normalization
         self.do_normalization = True if self.normalization else False
         if self.normalization == "AnnotationNorm":
-            self.normalization = Annotation_normalization()
+            self.normalization = Annotation_normalization(in_dim)
         else: self.do_normalization = False
     
     def forward(self, x):
@@ -79,40 +80,44 @@ class Regularization(nn.Module):
         if self.do_normalization: x = self.normalization(x)
         return x
         
-
-class Annotation_normalization(nn.Module):
-    def __init__(self, eps=1e-100, momentum=0.99):
+class Annotation_normalization(pl.LightningModule):
+    def __init__(self, in_dim, eps=0., momentum=0.99):
         super().__init__()
-        self.eps = torch.tensor(eps, requires_grad=False)
+        self.eps = torch.tensor(eps, requires_grad=False) #1e-100
         self.momentum = torch.tensor(momentum, requires_grad=False)
         self.init = True
-        
+        self.mean = torch.nn.Parameter(torch.zeros((in_dim,), dtype=torch.float16))
+        self.std = torch.nn.Parameter(torch.ones((in_dim,), dtype=torch.float16))
+                
     def forward(self, x):
         if x.ndim  == 4:
-            # exclude padded variants from mean, std computation and 
-            # standardization application to tensor.
-            # only applies to inital layer, since all subsequent will do (x * weight) + bias
-            # and since they wont sum to 0, only the inital layer will be considered
+            # Exclude padded variants from mean and std computation and 
+            # their application to the input tensor.
+            # This applies only to inital layer, since all subsequent layers will have done
+            # x' = (x * weight) + bias at least once, s. t. x' != 0.
             mask = torch.where(x.sum(dim=3) == 0, False, True)
         else: mask = torch.ones(x.shape[:-1]).to(bool)
+        if self.training:
+            mean = torch.mean(x[mask], dim=0).detach()
+            std = torch.std(x[mask], dim=0).detach()
         
-        mean = torch.mean(x[mask], dim=0).detach()
-        std = torch.std(x[mask], dim=0).detach()
-
-        if self.init: 
-            if x.is_cuda: self.momentum = self.momentum.cuda()
-            self.mean, self.std, self.init = mean, std, False
-        else:
-            if self.momentum > 0:
-                self.mean = self.mean * self.momentum + mean * (1 - self.momentum)
-                self.std = self.std * self.momentum + std * (1 - self.momentum)
-            else: self.mean, self.std = mean, std
-        
-            x[mask] = x[mask].sub(self.mean).div(self.std.add(self.eps)) 
+            if self.init: 
+                self.init = False
+                self.std, self.mean = torch.nn.Parameter(mean), torch.nn.Parameter(std)
+                self.mean.requires_grad, self.std.requires_grad = False, False
+                if x.is_cuda: self.momentum = self.momentum.cuda()
+            else:
+                if self.momentum > 0:
+                    self.mean *= self.momentum
+                    self.mean += mean * (1 - self.momentum)
+                    self.std *= self.momentum
+                    self.std += std * (1 - self.momentum)
+                else: self.mean, self.std = mean, std
+        x[mask] = x[mask].sub(self.mean).div(self.std.add(self.eps)) 
         return x
+    
 
-
-class Layers(nn.Module):
+class Layers(pl.LightningModule):
     def __init__(self, n_layers, bottleneck_layers, res_layers, input_dim, output_dim, activation, normalization, init_power_two, steady_dim):
         super().__init__()
         self.n_layers = n_layers
@@ -201,11 +206,23 @@ class Layers(nn.Module):
         layer = layer["layer"](in_dim, out_dim, bias, **layer["args"], solo=solo)
         return layer
 
+class WLC(pl.LightningModule):
+    def __init__(self, top=3):
+        super().__init__()
+        self.top = top
+        self.factor = torch.tensor([1/n for n in range(1, top + 1)]).unsqueeze(1)
+        if torch.cuda.is_available(): self.factor = self.factor.cuda()
 
+    def forward(self, x):
+        values = torch.sort(x, dim=2, descending=True).values
+        values = values[:, :, :self.top, :]
+        values = torch.sum(values * self.factor, dim=2)
+        return values
+        
 class Pooling(pl.LightningModule):
     def __init__(self, activation, normalization, pool, dim, n_variants):
         super().__init__()
-        if pool not in ('sum', 'max','softmax'):  raise ValueError(f'Unknown pooling operation {pool}')
+        if pool not in ('sum', 'max','softmax', 'WLC'):  raise ValueError(f'Unknown pooling operation {pool}')
         self.layer = Layer(activation, normalization)
         self.pool = pool
         self.dim = dim
@@ -227,6 +244,9 @@ class Pooling(pl.LightningModule):
             self.gain = 2.0 #When 0.0 is equivalent to avg pooling, and when ~2.0 and `per_channel=False` it's equivalent to max pooling.
             with torch.no_grad(): self.to_attn_logits.layer.weight.mul_(self.gain)
             return torch.sum, {"dim": -1}  
+        elif self.pool == 'WLC':
+            wlc = WLC()
+            return wlc.forward, {}
         else: return torch.max, {"dim": 2} 
 
     def forward(self, x):
