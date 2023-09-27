@@ -85,34 +85,43 @@ class Annotation_normalization(pl.LightningModule):
         super().__init__()
         self.eps = torch.tensor(eps, requires_grad=False) #1e-100
         self.momentum = torch.tensor(momentum, requires_grad=False)
+        
         self.init = True
         self.mean = torch.nn.Parameter(torch.zeros((in_dim,), dtype=torch.float16))
         self.std = torch.nn.Parameter(torch.ones((in_dim,), dtype=torch.float16))
-                
+        self.mean.requires_grad = False
+        self.std.requires_grad = False
+    
+    def reset_params(self, mean, std):
+        self.mean += mean - self.mean
+        self.std += std - self.std
+    
+    def update_params(self, x, mask):
+        mean = torch.mean(x[mask], dim=0).detach()
+        std = torch.std(x[mask], dim=0).detach()
+        if self.init: 
+            self.reset_params(mean, std)
+            if x.is_cuda: 
+                self.eps = self.eps.cuda()
+                self.momentum = self.momentum.cuda()
+            self.init = False
+        else:
+            if 0 < self.momentum < 1:
+                self.mean *= self.momentum
+                self.mean += mean * (1 - self.momentum)
+                self.std *= self.momentum
+                self.std += std * (1 - self.momentum)
+            else: 
+                self.reset_params(mean, std)
+            
     def forward(self, x):
-        if x.ndim  == 4:
-            # Exclude padded variants from mean and std computation and 
-            # their application to the input tensor.
-            # This applies only to inital layer, since all subsequent layers will have done
-            # x' = (x * weight) + bias at least once, s. t. x' != 0.
-            mask = torch.where(x.sum(dim=3) == 0, False, True)
+        # Exclude padded variants from mean and std computation and 
+        # their application to the input tensor.
+        # This applies only to inital layer, since all subsequent layers will have done
+        # x' = (x * weight) + bias at least once, s. t. x' != 0.
+        if x.ndim  == 4: mask = torch.where(x.sum(dim=3) == 0, False, True)
         else: mask = torch.ones(x.shape[:-1]).to(bool)
-        if self.training:
-            mean = torch.mean(x[mask], dim=0).detach()
-            std = torch.std(x[mask], dim=0).detach()
-        
-            if self.init: 
-                self.init = False
-                self.std, self.mean = torch.nn.Parameter(mean), torch.nn.Parameter(std)
-                self.mean.requires_grad, self.std.requires_grad = False, False
-                if x.is_cuda: self.momentum = self.momentum.cuda()
-            else:
-                if self.momentum > 0:
-                    self.mean *= self.momentum
-                    self.mean += mean * (1 - self.momentum)
-                    self.std *= self.momentum
-                    self.std += std * (1 - self.momentum)
-                else: self.mean, self.std = mean, std
+        if self.training: self.update_params(x, mask) 
         x[mask] = x[mask].sub(self.mean).div(self.std.add(self.eps)) 
         return x
     
@@ -206,11 +215,12 @@ class Layers(pl.LightningModule):
         layer = layer["layer"](in_dim, out_dim, bias, **layer["args"], solo=solo)
         return layer
 
-class WLC(pl.LightningModule):
-    def __init__(self, top=3):
+class WLC(nn.Module):
+    def __init__(self, top=2, ranked=True):
         super().__init__()
         self.top = top
-        self.factor = torch.tensor([1/n for n in range(1, top + 1)]).unsqueeze(1)
+        if ranked: self.factor = torch.tensor([1/n for n in range(1, top + 1)]).unsqueeze(1)
+        else: self.factor = torch.ones((2,1))
         if torch.cuda.is_available(): self.factor = self.factor.cuda()
 
     def forward(self, x):
