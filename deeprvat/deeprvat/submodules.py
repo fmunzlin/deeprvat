@@ -219,8 +219,9 @@ class WLC(nn.Module):
     def __init__(self, top=2, ranked=True):
         super().__init__()
         self.top = top
-        if ranked: self.factor = torch.tensor([1/n for n in range(1, top + 1)]).unsqueeze(1)
-        else: self.factor = torch.ones((2,1))
+        # if ranked: self.factor = torch.tensor([1/n for n in range(1, top + 1)]).unsqueeze(1)
+        # else: self.factor = torch.ones((1,1))
+        self.factor = torch.ones((1,1))
         if torch.cuda.is_available(): self.factor = self.factor.cuda()
 
     def forward(self, x):
