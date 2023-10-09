@@ -224,14 +224,14 @@ class MultiphenoDataset(Dataset):
         min_variant_count: int,
         batch_size: int,
         split: str = "train",
-        cache_tensors: bool = False):
-        # balancing_factor: bool = False):
+        cache_tensors: bool = False,
+        balancing_factor: bool = False):
         super().__init__()
         
         self.data = data
         self.split = split
         self.cache_tensors = cache_tensors
-        self.balancing_factor = False
+        self.balancing_factor = balancing_factor
         self.batch_size = batch_size
         self.active_annotations = np.arange(33)  
         self.min_variant_count = min_variant_count
