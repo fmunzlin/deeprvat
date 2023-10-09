@@ -15,7 +15,7 @@ from deeprvat.metrics import (
     PearsonCorr,
     PearsonCorrTorch,
     RSquared,
-    AveragePrecisionWithLogits,
+    AveragePrecisionWithLogits
 )
 
 logging.basicConfig(
@@ -29,6 +29,9 @@ METRICS = {
     "Huber": nn.SmoothL1Loss,
     "MAE": nn.L1Loss,
     "MSE": nn.MSELoss,
+    # "Huber": Huber,
+    # "MAE": MAE,
+    # "MSE": MSE,
     "RSquared": RSquared,
     "PearsonCorr": PearsonCorr,
     "PearsonCorrTorch": PearsonCorrTorch,
@@ -85,6 +88,7 @@ class BaseModel(pl.LightningModule):
         else:
             raise ValueError("Unknown objective_mode configuration parameter")
 
+
     def configure_optimizers(self) -> torch.optim.Optimizer:
         optimizer_config = self.hparams["optimizer"]
         optimizer_class = getattr(torch.optim, optimizer_config["type"])
@@ -119,10 +123,23 @@ class BaseModel(pl.LightningModule):
             raise RuntimeError("NaNs found in training loss")
         return loss
 
+    # def validation_step(self, batch: dict, batch_idx: int):
+    #     pred = self(batch)
+    #     y_by_pheno = {pheno: pheno_batch["y"] for pheno, pheno_batch in batch.items()}
+    #     result = {}
+    #     for name, fn in self.metric_fns.items():
+    #         result[name] = fn(pred, y_by_pheno)
+    #     return result
+    
+    # def validation_epoch_end(self, prediction_y: List[Dict[str, Dict[str, torch.Tensor]]]):
+    #     pass
+        
+
     def validation_step(self, batch: dict, batch_idx: int):
         y_by_pheno = {pheno: pheno_batch["y"]
                       for pheno, pheno_batch in batch.items()}
         return {"y_pred_by_pheno": self(batch), "y_by_pheno": y_by_pheno}
+    
 
     def validation_epoch_end(self, prediction_y: List[Dict[str, Dict[str, torch.Tensor]]]):
         y_pred_by_pheno = dict()
@@ -138,6 +155,7 @@ class BaseModel(pl.LightningModule):
             for pheno, ys in target.items():
                 y_by_pheno[pheno] = torch.cat([
                     y_by_pheno.get(pheno, torch.tensor([],device=self.device)), ys])
+
 
         results = dict()
         for name, fn in self.metric_fns.items():
@@ -171,8 +189,8 @@ class BaseModel(pl.LightningModule):
 class Phenotype_classifier(pl.LightningModule):
     def __init__(self, hparams, phenotypes, n_genes, gene_count):
         super().__init__()
-        # pl.LightningModule already has attribute self.hparams,
-        #  which is inherited from its parent class
+        # class already has attribute self.hparams set 
+        # by its parent class
         self.hparams_ = hparams
         self.phenotypes = phenotypes
         self.n_genes = n_genes
@@ -181,7 +199,7 @@ class Phenotype_classifier(pl.LightningModule):
         self.init_function = getattr(self.hparams_, "init", False)
         self.normalization = getattr(self.hparams_, "normalization", False)
         self.activation = getattr(nn, getattr(self.hparams_, "activation", "LeakyReLU"))()
-        self.dropout = getattr(self.hparams_, "classifier_dropout", False)
+        self.dropout = getattr(self.hparams_, "classification_dropout", False)
         if self.dropout: self.drop_layer = nn.Dropout(p=self.dropout)
 
         self.embed_pheno = hasattr(self.hparams_, "embed_pheno")
@@ -203,13 +221,12 @@ class Phenotype_classifier(pl.LightningModule):
         return init_params(self.hparams_, embedding)
     
     def pad_genes(self, x, gene_id):
-        padding_mask = torch.zeros((x.shape[0], self.gene_count), dtype=x.dtype)
-        if x.is_cuda: padding_mask = padding_mask.cuda()
+        padding_mask = torch.zeros((x.shape[0], self.gene_count), dtype=x.dtype, device=x.device)
         padding_mask[:, gene_id] = x
         return padding_mask
     
     def get_model(self, prefix, input_dim, output_dim, n_layers, bottleneck_layers, res_layers):
-        Layers_obj = Layers(n_layers, bottleneck_layers, res_layers, input_dim, output_dim, self.activation, self.normalization, False, True)
+        Layers_obj = Layers(n_layers, bottleneck_layers, res_layers, input_dim, output_dim, False, self.activation, self.normalization, False, True)
         model = []  
         for l in range(n_layers - 1):       
             model.append((f'{prefix}_layer_{l}', Layers_obj.get_layer(l)))
@@ -286,6 +303,8 @@ class DeepSet(BaseModel):
         logger.info("Initializing DeepSet model with parameters:")
         pprint(self.hparams)
 
+        self.gene_count = gene_count
+        
         self.normalization = getattr(self.hparams, "normalization", False)
         self.activation = getattr(nn, getattr(self.hparams, "activation", "LeakyReLU"))(inplace=False)
         # self.activation = GELU()
@@ -300,6 +319,7 @@ class DeepSet(BaseModel):
         self.phi = self.get_model("phi", 
                                   n_annotations, 
                                   self.hparams.phi_hidden_dim, 
+                                  self.hparams.phi_internal_dim,
                                   self.hparams.phi_layers, 
                                   self.hparams.phi_res_bottleneck_layers,
                                   self.hparams.phi_res_layers)
@@ -308,11 +328,13 @@ class DeepSet(BaseModel):
         self.rho = self.get_model("rho", 
                                   self.hparams.phi_hidden_dim, 
                                   self.hparams.rho_hidden_dim, 
+                                  self.hparams.rho_internal_dim,
                                   self.hparams.rho_layers - 1, 
                                   self.hparams.rho_res_bottleneck_layers,
                                   self.hparams.rho_res_layers)
 
         self.geno_pheno = Phenotype_classifier(self.hparams, phenotypes, n_genes, gene_count)
+        
         self.deep_rvat = lambda x : self.rho(self.pool(self.phi(x)))
 
         if agg_model is not None:
@@ -328,12 +350,11 @@ class DeepSet(BaseModel):
         self.agg_model.train(False if self.hparams.stage == "val" else True)
         self.train(False if self.hparams.stage == "val" else True)
     
-    def get_model(self, prefix, input_dim, output_dim, n_layers, bottleneck_layers, res_layers):
+    def get_model(self, prefix, input_dim, output_dim, internal_dim, n_layers, bottleneck_layers, res_layers):
         model = [] 
-        Layers_obj = Layers(n_layers, bottleneck_layers, res_layers, input_dim, output_dim, self.activation, self.normalization, self.init_power_two, self.steady_dim)
+        Layers_obj = Layers(n_layers, bottleneck_layers, res_layers, input_dim, output_dim, internal_dim, self.activation, self.normalization, self.init_power_two, self.steady_dim)
         for l in range(n_layers):         
             model.append((f"{prefix}_layer_{l}", Layers_obj.get_layer(l)))
-            # model.append((f"{prefix}_dropout_{l}", nn.Dropout(p=0.1)))
         if prefix == "rho": model.append((f"{prefix}_linear_{n_layers}", Layers_obj.get_layer_set_dim(l, output_dim, 1, solo=True))) 
         
         model = nn.Sequential(OrderedDict(model))
@@ -342,17 +363,16 @@ class DeepSet(BaseModel):
     
     def forward(self, batch):
         result = dict()
-        # if self.training: print("----------")
         for pheno, this_batch in batch.items():
             x = this_batch["rare_variant_annotations"] 
             # x.shape = samples x genes x annotations x variants
             burden_score = self.agg_model(x).squeeze(dim=2)
-            # print(burden_score.shape)
             result[pheno] = self.geno_pheno.forward(burden_score, 
                                                     this_batch["covariates"], 
                                                     pheno, 
                                                     this_batch["gene_id"])
         return result
+
 
 class GELU(nn.Module):
     def forward(self, x):
