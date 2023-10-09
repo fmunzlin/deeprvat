@@ -127,7 +127,7 @@ class Annotation_normalization(pl.LightningModule):
     
 
 class Layers(pl.LightningModule):
-    def __init__(self, n_layers, bottleneck_layers, res_layers, input_dim, output_dim, activation, normalization, init_power_two, steady_dim):
+    def __init__(self, n_layers, bottleneck_layers, res_layers, input_dim, output_dim, internal_dim, activation, normalization, init_power_two, steady_dim, ):
         super().__init__()
         self.n_layers = n_layers
         self.bottleneck_layers = bottleneck_layers
@@ -135,6 +135,7 @@ class Layers(pl.LightningModule):
         self.layer = Layer(activation, normalization)
         
         self.input_dim = input_dim
+        self.internal_dim = internal_dim
         self.output_dim = output_dim
         self.activation = activation
         self.init_power_two = init_power_two
@@ -147,9 +148,13 @@ class Layers(pl.LightningModule):
 
     def get_next_power_of_two(self, dim, factor):
         if factor == 2:
-            return 2**list(filter(lambda x: (2**x >= dim), range(10)))[0]
-        else:
-            return 2**list(filter(lambda x: (2**x <= dim), range(10)))[-1]
+            return 2**list(filter(lambda x: (2**x > dim), range(10)))[0]
+        else: return 2**list(filter(lambda x: (2**x <= dim), range(10)))[-1]
+    
+    def get_last_power_of_two(self, dim, factor):
+        if factor == 2:
+            return 2**list(filter(lambda x: (2**x < dim), reversed(range(10))))[0]
+        else: return dim
     
     def get_operations(self):
         if self.input_dim < self.output_dim:
@@ -160,6 +165,37 @@ class Layers(pl.LightningModule):
             operation, factor = min, 1
         return operation, factor
 
+    def get_ballon_dims(self):
+        dims = []
+        step_dim = self.input_dim
+        if self.internal_dim: assert self.input_dim < self.internal_dim > self.output_dim
+        for i in range(self.n_layers):
+            input_dim = step_dim
+            if self.steady_dim:
+                buildup_layers = 1
+                return_layer =  2
+            else:
+                to_power_two = list(filter(lambda x: (2**x >= self.input_dim), range(10)))[0]  
+                to_dim = list(filter(lambda x: (2**x == self.internal_dim), reversed(range(10))))[0]
+                if 2**to_power_two > self.input_dim: to_power_two -= 1 # none power two to power two
+                buildup_layers = to_dim - to_power_two
+
+                to_dim = list(filter(lambda x: (2**x == self.internal_dim), reversed(range(10))))[0]
+                to_min = list(filter(lambda x: (2**x <= self.output_dim), reversed(range(10))))[0]
+                return_layer = to_dim - to_min + 1 # internal_dim to min_dim, to 1
+            
+            intermediate_layers = self.n_layers - buildup_layers - return_layer - self.res_layers - self.bottleneck_layers
+            if self.res_layers + self.bottleneck_layers <= i:
+                if i < buildup_layers + self.bottleneck_layers + self.res_layers:
+                    if self.steady_dim: step_dim = self.internal_dim
+                    else: step_dim = min(self.internal_dim, self.get_next_power_of_two(step_dim, 2))
+                elif i > intermediate_layers + buildup_layers + self.bottleneck_layers + self.res_layers:
+                    if self.steady_dim and i == self.n_layers -1: step_dim = self.output_dim 
+                    else: step_dim = max(self.output_dim, self.get_last_power_of_two(step_dim, 2))
+            dims.append([int(input_dim), int(step_dim)]) 
+        assert self.output_dim == step_dim
+        return dims
+    
     def get_dims(self):
         operation, factor = self.get_operations()
         dims = []
@@ -176,10 +212,7 @@ class Layers(pl.LightningModule):
                         if i == self.n_layers - 1: 
                             step_dim = self.output_dim 
                         else:
-                            if input_dim not in [2**i for i in range(10)]:
-                                step_dim = operation(self.output_dim, self.get_next_power_of_two(input_dim, factor))
-                            else: 
-                                step_dim = operation(self.output_dim, input_dim * factor)
+                            step_dim = operation(self.output_dim, self.get_next_power_of_two(input_dim, factor))
             dims.append([int(input_dim), int(step_dim)]) 
         assert self.output_dim == step_dim
         return dims
@@ -202,7 +235,8 @@ class Layers(pl.LightningModule):
         assert not self.init_power_two or not self.steady_dim
         # assert self.n_layers > self.res_layers + self.bottleneck_layers
         layers = self.get_layers()
-        dims = self.get_dims()
+        if self.internal_dim: dims = self.get_ballon_dims()
+        else: dims = self.get_dims()
         return layers, dims
 
     def get_layer(self, i, solo=False):
@@ -216,7 +250,7 @@ class Layers(pl.LightningModule):
         return layer
 
 class WLC(nn.Module):
-    def __init__(self, top=2, ranked=True):
+    def __init__(self, top=2, ranked=False):
         super().__init__()
         self.top = top
         # if ranked: self.factor = torch.tensor([1/n for n in range(1, top + 1)]).unsqueeze(1)
