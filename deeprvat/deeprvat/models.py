@@ -10,7 +10,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelSummary
 
 from deeprvat.utils import init_model
-from deeprvat.deeprvat.submodules import Pooling, Layers
+from deeprvat.deeprvat.submodules import Pooling, Layers, Annotation_normalization
 from deeprvat.metrics import (
     PearsonCorr,
     PearsonCorrTorch,
@@ -304,7 +304,6 @@ class DeepSet(BaseModel):
         pprint(self.hparams)
 
         self.gene_count = gene_count
-        
         self.normalization = getattr(self.hparams, "normalization", False)
         self.activation = getattr(nn, getattr(self.hparams, "activation", "LeakyReLU"))(inplace=False)
         # self.activation = GELU()
@@ -315,7 +314,11 @@ class DeepSet(BaseModel):
         self.pool_layer = getattr(self.hparams, "pool", "sum")
         self.init_power_two = getattr(self.hparams, "first_layer_nearest_power_two", False)
         self.steady_dim = getattr(self.hparams, "steady_dim", False)
-
+        # self.invert_rho = False
+        self.dropout = getattr(self.hparams, "dropout", False)
+        if self.dropout: self.dropout = nn.Dropout(p=self.dropout)
+            
+        
         self.phi = self.get_model("phi", 
                                   n_annotations, 
                                   self.hparams.phi_hidden_dim, 
@@ -332,9 +335,16 @@ class DeepSet(BaseModel):
                                   self.hparams.rho_layers - 1, 
                                   self.hparams.rho_res_bottleneck_layers,
                                   self.hparams.rho_res_layers)
+        # if self.invert_rho:
+        #     self.inv_rho = self.get_model("rho", 1, 
+        #                                 self.hparams.phi_hidden_dim,
+        #                                 self.hparams.rho_internal_dim,
+        #                                 self.hparams.rho_layers - 1, 
+        #                                 self.hparams.rho_res_bottleneck_layers,
+        #                                 self.hparams.rho_res_layers)
 
         self.geno_pheno = Phenotype_classifier(self.hparams, phenotypes, n_genes, gene_count)
-        
+
         self.deep_rvat = lambda x : self.rho(self.pool(self.phi(x)))
 
         if agg_model is not None:
@@ -349,24 +359,37 @@ class DeepSet(BaseModel):
             )
         self.agg_model.train(False if self.hparams.stage == "val" else True)
         self.train(False if self.hparams.stage == "val" else True)
-    
+        
     def get_model(self, prefix, input_dim, output_dim, internal_dim, n_layers, bottleneck_layers, res_layers):
         model = [] 
         Layers_obj = Layers(n_layers, bottleneck_layers, res_layers, input_dim, output_dim, internal_dim, self.activation, self.normalization, self.init_power_two, self.steady_dim)
         for l in range(n_layers):         
             model.append((f"{prefix}_layer_{l}", Layers_obj.get_layer(l)))
-        if prefix == "rho": model.append((f"{prefix}_linear_{n_layers}", Layers_obj.get_layer_set_dim(l, output_dim, 1, solo=True))) 
+        if prefix == "rho": 
+            model.append((f"{prefix}_linear_{n_layers}", Layers_obj.get_layer_set_dim(l, output_dim, 1, solo=True))) 
+            # if self.normalization == "AnnotationNorm":
+            #     self.burden_norm = Annotation_normalization(1)
+                
+        # if prefix == "rho": 
+        #     burden_layer = Layer_worker(self.activation, self.normalization, output_dim, 1)
+        #     model.append((f"{prefix}_linear_{n_layers}", burden_layer.layer)) 
+        #     self.burden_norm = burden_layer.regularization
+        #     self.burden_norm.do_activation = False
         
         model = nn.Sequential(OrderedDict(model))
         model = init_params(self.hparams, model)
         return model
+
     
     def forward(self, batch):
         result = dict()
         for pheno, this_batch in batch.items():
             x = this_batch["rare_variant_annotations"] 
             # x.shape = samples x genes x annotations x variants
-            burden_score = self.agg_model(x).squeeze(dim=2)
+            burden_score = self.agg_model(x)
+            # if self.normalization == "AnnotationNorm": 
+            #     burden_score = self.burden_norm(burden_score)
+            burden_score = burden_score.squeeze(dim=2)
             result[pheno] = self.geno_pheno.forward(burden_score, 
                                                     this_batch["covariates"], 
                                                     pheno, 
