@@ -6,8 +6,7 @@ import math
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
-from deeprvat.utils import pad_variants
-     
+from deeprvat.utils import pad_variants  
             
 class Layer_worker(pl.LightningModule):
     def __init__(self, activation, normalization, in_dim, out_dim, bias=True, solo=False):
@@ -70,13 +69,14 @@ class Regularization(pl.LightningModule):
         super().__init__()
         self.activation = activation
         self.normalization = normalization
+        self.do_activation = True
         self.do_normalization = True if self.normalization else False
         if self.normalization == "AnnotationNorm":
             self.normalization = Annotation_normalization(in_dim)
         else: self.do_normalization = False
     
     def forward(self, x):
-        x = self.activation(x)
+        if self.do_activation: x = self.activation(x)
         if self.do_normalization: x = self.normalization(x)
         return x
         
@@ -86,11 +86,15 @@ class Annotation_normalization(pl.LightningModule):
         self.eps = torch.tensor(eps, requires_grad=False) #1e-100
         self.momentum = torch.tensor(momentum, requires_grad=False)
         
-        self.init = True
+        # self.init = True
         self.mean = torch.nn.Parameter(torch.zeros((in_dim,), dtype=torch.float16))
         self.std = torch.nn.Parameter(torch.ones((in_dim,), dtype=torch.float16))
         self.mean.requires_grad = False
         self.std.requires_grad = False
+        
+        # if torch.cuda.is_available(): 
+        #     self.eps = self.eps.cuda()
+        #     self.momentum = self.momentum.cuda()
     
     def reset_params(self, mean, std):
         self.mean += mean - self.mean
@@ -99,21 +103,21 @@ class Annotation_normalization(pl.LightningModule):
     def update_params(self, x, mask):
         mean = torch.mean(x[mask], dim=0).detach()
         std = torch.std(x[mask], dim=0).detach()
-        if self.init: 
+        # if self.init: 
+        #     self.reset_params(mean, std)
+        #     if x.is_cuda: 
+        #         self.eps = self.eps.cuda()
+        #         self.momentum = self.momentum.cuda()
+        #     self.init = False
+        # else:
+        if 0 < self.momentum < 1:
+            self.mean *= self.momentum
+            self.mean += mean * (1 - self.momentum)
+            self.std *= self.momentum
+            self.std += std * (1 - self.momentum)
+        else: 
             self.reset_params(mean, std)
-            if x.is_cuda: 
-                self.eps = self.eps.cuda()
-                self.momentum = self.momentum.cuda()
-            self.init = False
-        else:
-            if 0 < self.momentum < 1:
-                self.mean *= self.momentum
-                self.mean += mean * (1 - self.momentum)
-                self.std *= self.momentum
-                self.std += std * (1 - self.momentum)
-            else: 
-                self.reset_params(mean, std)
-            
+        
     def forward(self, x):
         # Exclude padded variants from mean and std computation and 
         # their application to the input tensor.
@@ -124,17 +128,16 @@ class Annotation_normalization(pl.LightningModule):
         if self.training: self.update_params(x, mask) 
         x[mask] = x[mask].sub(self.mean).div(self.std.add(self.eps)) 
         return x
-    
 
 class Layers(pl.LightningModule):
-    def __init__(self, n_layers, bottleneck_layers, res_layers, input_dim, output_dim, internal_dim, activation, normalization, init_power_two, steady_dim, ):
+    def __init__(self, n_layers, bottleneck_layers, res_layers, input_dim, output_dim, internal_dim, activation, normalization, init_power_two, steady_dim):
         super().__init__()
         self.n_layers = n_layers
         self.bottleneck_layers = bottleneck_layers
         self.res_layers = res_layers
         self.layer = Layer(activation, normalization)
         
-        self.input_dim = input_dim
+        self.input_dim = input_dim 
         self.internal_dim = internal_dim
         self.output_dim = output_dim
         self.activation = activation
@@ -247,10 +250,10 @@ class Layers(pl.LightningModule):
     def get_layer_set_dim(self, i, in_dim, out_dim, bias=True, solo=False):
         layer = self.layer_dict[self.layers[i]]
         layer = layer["layer"](in_dim, out_dim, bias, **layer["args"], solo=solo)
-        return layer
+        return layer    
 
-class WLC(nn.Module):
-    def __init__(self, top=2, ranked=False):
+class WLC(pl.LightningModule):
+    def __init__(self, top=2):
         super().__init__()
         self.top = top
         # if ranked: self.factor = torch.tensor([1/n for n in range(1, top + 1)]).unsqueeze(1)
@@ -258,16 +261,42 @@ class WLC(nn.Module):
         self.factor = torch.ones((1,1))
         if torch.cuda.is_available(): self.factor = self.factor.cuda()
 
-    def forward(self, x):
+    def forward(self, x):       
+        # input(torch.topk(x, k=2, dim=2).values.shape)
+        # return torch.sum(torch.topk(x, k=2, dim=2).values, dim=2)
         values = torch.sort(x, dim=2, descending=True).values
         values = values[:, :, :self.top, :]
         values = torch.sum(values * self.factor, dim=2)
         return values
+
+# multiple invariant aggregation function    
+class MIAF(pl.LightningModule):
+    def __init__(self, layer):
+        super().__init__()
+        self.WLC = WLC()
+        self.mapping = layer.__getitem__(4, 1)
+        if torch.cuda.is_available(): self.mapping = self.mapping.cuda()
         
+    def forward(self, x):
+        # top2
+        # sum
+        # (maybe) softmax
+        # (maybe) min
+        # (maybe) mean or median
+
+        top2 = self.WLC.forward(x).unsqueeze(2)
+        sum = torch.sum(x, dim=2).unsqueeze(2)
+        min = torch.min(x, dim=2).values.unsqueeze(2)
+        mean = torch.mean(x, dim=2).unsqueeze(2)
+        # median = torch.median(x, dim=2).values.unsqueeze(2)
+        miaf = torch.cat([min, sum, mean, top2], dim=2).permute((0, 1, 3, 2))
+        return self.mapping(miaf).squeeze(3)
+     
 class Pooling(pl.LightningModule):
     def __init__(self, activation, normalization, pool, dim, n_variants):
         super().__init__()
-        if pool not in ('sum', 'max','softmax', 'WLC'):  raise ValueError(f'Unknown pooling operation {pool}')
+        
+        if pool not in ('sum', 'max','softmax', 'WLC', 'MIAF'):  raise ValueError(f'Unknown pooling operation {pool}')
         self.layer = Layer(activation, normalization)
         self.pool = pool
         self.dim = dim
@@ -290,8 +319,9 @@ class Pooling(pl.LightningModule):
             with torch.no_grad(): self.to_attn_logits.layer.weight.mul_(self.gain)
             return torch.sum, {"dim": -1}  
         elif self.pool == 'WLC':
-            wlc = WLC()
-            return wlc.forward, {}
+            return WLC().forward, {}
+        elif self.pool == "MIAF":
+            return MIAF(self.layer).forward, {}
         else: return torch.max, {"dim": 2} 
 
     def forward(self, x):
